@@ -1,0 +1,136 @@
+import type { IExecuteFunctions, ILoadOptionsFunctions } from 'n8n-workflow';
+import { createHash } from 'node:crypto';
+
+import type { ExportTraceServiceRequest } from './otlp';
+
+/*
+ * Minimal Cerebro client for the HITL node. The API key is exchanged for a
+ * short-lived token, which is cached per gateway and key until shortly before it
+ * expires so the agent lookup and the trace export share one exchange.
+ */
+
+export const CEREBRO_CREDENTIAL = 'cerebroApi';
+
+type Ctx = IExecuteFunctions | ILoadOptionsFunctions;
+
+interface CerebroCredentials {
+	baseUrl: string;
+	apiKey: string;
+}
+
+export interface CerebroAgent {
+	agent_id: string;
+	agent_name: string;
+	status?: string;
+	ingestion_mode?: string;
+}
+
+interface CachedToken {
+	token: string;
+	expiresAt: number;
+}
+
+// Shared across invocations in the same process. Keyed by a hash so the raw key
+// is never used as a cache key.
+const tokenCache = new Map<string, CachedToken>();
+
+const trimBase = (baseUrl: string) => baseUrl.replace(/\/+$/, '');
+// Scope the cache entry to the gateway as well as the key: the same key pointed at
+// two gateways must not reuse a JWT minted by the other one.
+const fingerprint = (baseUrl: string, apiKey: string) =>
+	createHash('sha256')
+		.update(`${trimBase(baseUrl)}\n${apiKey}`)
+		.digest('hex');
+
+/** Exchanges the API key for a token, reusing a cached one until 30s before expiry. */
+async function cerebroToken(ctx: Ctx, credentials: CerebroCredentials): Promise<string> {
+	const key = fingerprint(credentials.baseUrl, credentials.apiKey);
+	const cached = tokenCache.get(key);
+	if (cached && Date.now() < cached.expiresAt) return cached.token;
+
+	const response = (await ctx.helpers.httpRequest({
+		url: `${trimBase(credentials.baseUrl)}/config/v1/auth/api-keys/token`,
+		method: 'POST',
+		json: true,
+		headers: { 'content-type': 'application/json' },
+		body: { api_key: credentials.apiKey },
+	})) as { access_token: string; expires_in?: number };
+
+	const ttlMs = Math.max(0, (response.expires_in ?? 300) * 1000 - 30_000);
+	tokenCache.set(key, { token: response.access_token, expiresAt: Date.now() + ttlMs });
+	return response.access_token;
+}
+
+async function credsAndToken(ctx: Ctx) {
+	const credentials = await ctx.getCredentials<CerebroCredentials>(CEREBRO_CREDENTIAL);
+	const token = await cerebroToken(ctx, credentials);
+	return { baseUrl: trimBase(credentials.baseUrl), token };
+}
+
+/** All agents configured for the key's tenant, for the node's Agent dropdown. */
+export async function cerebroListAgents(ctx: Ctx): Promise<CerebroAgent[]> {
+	const { baseUrl, token } = await credsAndToken(ctx);
+	const response = (await ctx.helpers.httpRequest({
+		url: `${baseUrl}/config/v1/agents`,
+		method: 'GET',
+		json: true,
+		headers: { Authorization: `Bearer ${token}` },
+	})) as { items?: CerebroAgent[] };
+	return response.items ?? [];
+}
+
+export interface CerebroIngestResult {
+	delivered: boolean;
+	url: string;
+	acceptedSpans?: number;
+	rejectedSpans?: number;
+	error?: string;
+}
+
+/**
+ * Sends the trace to Cerebro for review. Best effort: a delivery failure is
+ * reported on the item rather than failing the workflow.
+ */
+export async function cerebroIngestTraces(
+	ctx: IExecuteFunctions,
+	agentId: string,
+	payload: ExportTraceServiceRequest,
+): Promise<CerebroIngestResult> {
+	const { baseUrl, token } = await credsAndToken(ctx);
+	const url = `${baseUrl}/ingest/v1/agents/${encodeURIComponent(agentId)}/traces`;
+	try {
+		const res = (await ctx.helpers.httpRequest({
+			url,
+			method: 'POST',
+			json: true,
+			headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+			body: payload,
+		})) as { accepted_spans?: number; rejected_spans?: number };
+		return {
+			delivered: true,
+			url,
+			acceptedSpans: res.accepted_spans,
+			rejectedSpans: res.rejected_spans,
+		};
+	} catch (error) {
+		ctx.logger.warn('Cerebro OTLP trace ingest failed', {
+			agentId,
+			error: (error as Error).message,
+		});
+		return { delivered: false, url, error: (error as Error).message };
+	}
+}
+
+/** Resolves an agent's display name for the trace context; id-only on failure. */
+export async function cerebroAgentInfo(
+	ctx: Ctx,
+	agentId: string | undefined,
+): Promise<{ agentId?: string; agentName?: string }> {
+	if (!agentId) return {};
+	try {
+		const agent = (await cerebroListAgents(ctx)).find((a) => a.agent_id === agentId);
+		return { agentId, agentName: agent?.agent_name };
+	} catch {
+		return { agentId };
+	}
+}
