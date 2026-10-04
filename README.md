@@ -24,9 +24,15 @@ in the n8n docs.
 
 **In the n8n UI (self-hosted):**
 
-1. Go to **Settings → Community Nodes → Install**.
-2. Enter the package name `n8n-nodes-hitl-stack-agent`.
-3. Agree to the risks and install.
+1. Go to **Settings → Community Nodes** and click **Install**.
+2. Type the exact package name `n8n-nodes-hitl-stack-agent` into **npm Package Name**.
+   There is no search box: n8n installs by name. (The **Browse** button only opens
+   npm's website in a new tab.)
+3. Tick **I understand the risks of installing unverified code from a public
+   source** and click **Install**.
+
+Only the instance owner or an admin can install community nodes, and community
+nodes must be enabled on your instance.
 
 **Manually (npm):**
 
@@ -138,6 +144,10 @@ Chat Trigger → AI Agent (+ chat model) → HITLStackAgent → (next steps)
 
 - Handles one item per execution (use **Loop Over Items** for batches).
 - The agent's answer must be on the item's `output` field.
+- The question shown to the reviewer is read from an upstream item (within
+  **Context Depth**) that has a `chatInput`, `input`, `query` or `question` field,
+  as a Chat Trigger provides. If the question exists only in the AI Agent's own
+  prompt setting, the reviewer sees the answer without the question.
 - Model name and token usage are not captured in an *AI Agent + chat-model
   sub-node* topology, because n8n does not expose sub-node output to downstream
   nodes.
