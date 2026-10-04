@@ -1,6 +1,6 @@
 {
     "name": "n8n-nodes-hitl-stack-agent",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "description": "n8n community node that sends an agent's answer to Cerebro for non-blocking human review",
     "license": "MIT",
     "publishConfig": {
